@@ -3,14 +3,21 @@ __author__ = "Keith Sloan (keithsloan52) : Christophe Grellier (Chris_G)"
 __license__ = "LGPL 2.1"
 __doc__ = "import of 3DM file"
 
+# TODO
+# - figure out how colors are managed between objects, materials and layers
+# - convert Rhino materials into FC materials ?
+# - use real arc of circles for ArcCurves
+# - implement Brep face trimming (when available in rhino3dm ...)
+
+
 import FreeCAD 
 import os, io, sys
 import FreeCADGui 
 import Part
+from math import pi
 
 try:
     import rhino3dm as r3
-
 except ModuleNotFoundError:
     FreeCAD.Console.PrintError("You must install rhino3dm first !")
     exit()
@@ -67,21 +74,35 @@ class Rhino2FC:
     def get_point_and_weight(self, point4d):
         """Input : rhino3dm.Point4d
         Output : FreeCAD.Vector and weight"""
-        p = FreeCAD.Vector(point4d.X/point4d.W,
-                            point4d.Y/point4d.W,
-                            point4d.Z/point4d.W)
+        p = FreeCAD.Vector(point4d.X / point4d.W,
+                           point4d.Y / point4d.W,
+                           point4d.Z / point4d.W)
         return p, point4d.W
 
     def get_point(self, point):
         """Input : rhino3dm.Point3d or rhino3dm.Point3f
         Output : FreeCAD.Vector"""
-        return FreeCAD.Vector(p.X,p.Y,p.Z)
+        return FreeCAD.Vector(point.X, point.Y, point.Z)
 
     def get_color_and_transparency(self, rhino_color):
         """Input : Rhino color (r,g,b,a) in [0,255] range
         Output : FreeCAD color (r,g,b) in [0.0,1.0] range and transparency (int) in [0,100] range"""
         r,g,b,a = [v/255.0 for v in rhino_color]
         return (r,g,b), int((1-a)*100)
+
+    def get_color(self, rhino_color):
+        """Input : Rhino color (r,g,b,a) in [0,255] range
+        Output : FreeCAD color (r,g,b,a) in [0.0,1.0] range"""
+        r,g,b,a = [v/255.0 for v in rhino_color]
+        return r,g,b,a
+
+    def get_placement(self, center, normal):
+        """Computes a FreeCAD.Placement from Rhino center and normal"""
+        z = FreeCAD.Vector(0,0,1)
+        fc_norm = self.get_point(normal)
+        rot_axis = z.cross(fc_norm)
+        angle = z.getAngle(fc_norm)*180.0/pi
+        return FreeCAD.Placement(self.get_point(center), rot_axis, angle)
 
     def get_bspline_curve(self, curve):
         """Input : Rhino rhino3dm.NurbsCurve
@@ -147,6 +168,8 @@ class File3dm:
     def __init__(self, path):
         self.f3dm = r3.File3dm.Read(path)
         self.layers = []
+        self.groups = []
+        self.materials = []
         self.r2fc = Rhino2FC()
 
     def parse_objects(self, doc=None):
@@ -158,7 +181,7 @@ class File3dm:
             first_split = obj_fullname.split(".")
             second_split = first_split[-1].split(" ")
             print("-----------------\n{}".format(second_split[0]))
-            attrs(self.f3dm.Objects[i].Attributes)
+            #attrs(self.f3dm.Objects[i].Attributes)
             layer_idx = self.f3dm.Objects[i].Attributes.LayerIndex
             obj = self.import_geometry(doc, self.f3dm.Objects[i].Geometry)
             if obj:
@@ -173,6 +196,25 @@ class File3dm:
         for i in range(len(self.f3dm.Groups)):
             print("\nGroup {}".format(i))
             attrs(self.f3dm.Groups[i])
+            self.groups.append(self.f3dm.Groups[i])
+
+    def parse_materials(self, doc=None):
+        if not doc:
+            doc = FreeCAD.newDocument("3dm import")
+        for i in range(len(self.f3dm.Materials)):
+            print("\nMaterial {}".format(i))
+            m = self.f3dm.Materials[i]
+            #attrs(m)
+            mat = FreeCAD.Material()
+            mat.AmbientColor = self.r2fc.get_color(m.AmbientColor)
+            mat.DiffuseColor = self.r2fc.get_color(m.DiffuseColor)
+            mat.EmissiveColor = self.r2fc.get_color(m.EmissionColor)
+            mat.SpecularColor = self.r2fc.get_color(m.SpecularColor)
+            mat.Shininess = m.Shine
+            mat.Transparency = m.Transparency
+            self.materials.append(mat)
+        #if len(self.materials) == 0:
+            #self.materials.append(FreeCAD.Material())
 
     def parse_layers(self, doc=None):
         if not doc:
@@ -181,13 +223,23 @@ class File3dm:
             import Draft
         for i in range(len(self.f3dm.Layers)):
             print("\nLayer {}".format(i))
-            attrs(self.f3dm.Layers[i])
+            r3l = self.f3dm.Layers[i]
+            #attrs(r3l)
             layer = Draft.makeLayer()
             doc.recompute()
-            layer.Label = self.f3dm.Layers[i].Name
+            layer.Label = r3l.Name
+            mat_idx = r3l.RenderMaterialIndex
             if FreeCAD.GuiUp:
-                layer.ViewObject.LineColor = self.r2fc.get_color_and_transparency(self.f3dm.Layers[i].PlotColor)[0]
-                layer.ViewObject.ShapeColor, layer.ViewObject.Transparency = self.r2fc.get_color_and_transparency(self.f3dm.Layers[i].Color)
+                if mat_idx > 0 and mat_idx < len(self.materials):
+                    layer.ViewObject.LineColor = (0.0, 0.0, 0.0, 0.0) #self.r2fc.get_color(self.materials[mat_idx].DiffuseColor)
+                    layer.ViewObject.ShapeColor = self.r2fc.get_color(self.materials[mat_idx].DiffuseColor)
+                    layer.ViewObject.Transparency = int(self.materials[mat_idx].Transparency)
+                else:
+                    layer.ViewObject.LineColor = self.r2fc.get_color(r3l.PlotColor)
+                    layer.ViewObject.ShapeColor = self.r2fc.get_color(r3l.Color)
+                # Prevent black ShapeColor
+                if layer.ViewObject.ShapeColor[0:3] == (0.0, 0.0, 0.0):
+                    layer.ViewObject.ShapeColor = (1.0, 1.0, 1.0)
             self.layers.append(layer)
 
     def import_geometry(self, doc, geo):
@@ -201,7 +253,7 @@ class File3dm:
             print("has {} edges".format(len(geo.Edges)))
             shapes = []
             for i in range(len(geo.Faces)):
-                print(geo.Faces[i])
+                #print(geo.Faces[i])
                 s = self.r2fc.get_bspline_surface(geo.Faces[i].ToNurbsSurface())
                 shapes.append(s.toShape())
             com = Part.Compound(shapes)
@@ -216,12 +268,18 @@ class File3dm:
 
         if isinstance(geo, r3.Box):
             print("Box Object")
+            attrs(geo)
 
         if isinstance(geo, r3.Circle):
             print("Circle Object")
+            obj = doc.addObject("Part::Circle","Circle")
+            obj.Radius = geo.Radius
+            obj.Placement = self.r2fc.get_placement(geo.Center, geo.Normal)
+            return obj
 
         if isinstance(geo, r3.Cone):
             print("Cone Object")
+            attrs(geo)
 
         if isinstance(geo, r3.Curve):
             print("Curve Object")
@@ -230,21 +288,71 @@ class File3dm:
 
         if isinstance(geo, r3.Cylinder):
             print("Cylinder Object")
+            attrs(geo)
 
         if isinstance(geo, r3.Ellipse):
             print("Ellipse Object")
+            attrs(geo)
 
         if isinstance(geo, r3.Mesh):
             print("Mesh Object")
+            attrs(geo)
+            print("")
+            print("Vertices : {}".format(len(geo.Vertices)))
+            for i in range(min(len(geo.Vertices), 10)):
+                print(geo.Vertices[i])
+            print("Faces : {}".format(len(geo.Faces)))
+            print("-->Triangles : {}".format(geo.Faces. TriangleCount))
+            print("-->Quads : {}".format(geo.Faces.QuadCount))
+            for i in range(min(len(geo.Faces), 10)):
+                print(geo.Faces[i])
+            print("Normals : {}".format(len(geo.Normals)))
+            for i in range(min(len(geo.Normals), 10)):
+                print(geo.Normals[i])
+            
+            import Mesh
+            geo.Faces.ConvertQuadsToTriangles()
+            pts = []
+            for i in range(len(geo.Faces)):
+                for j in range(3):
+                    pts.append([geo.Vertices[geo.Faces[i][j]].X,
+                                geo.Vertices[geo.Faces[i][j]].Y,
+                                geo.Vertices[geo.Faces[i][j]].Z])
+            mesh = Mesh.Mesh(pts)
+            obj = doc.addObject("Mesh::Feature","Mesh")
+            obj.Mesh = mesh
+            return obj
 
         if isinstance(geo, r3.NurbsSurface):
             print("NurbsSurface Object")
+            s = self.r2fc.get_bspline_surface(geo)
+            obj = doc.addObject("Part::Feature","NurbsSurface")
+            obj.Shape = s.toShape()
+            return obj
+
+        if isinstance(geo, r3.Point):
+            print("Point Object")
+            obj = doc.addObject("Part::Vertex","Point")
+            obj.X = geo.Location.X
+            obj.Y = geo.Location.Y
+            obj.Z = geo.Location.Z
+            return obj
 
         if isinstance(geo, r3.PointCloud):
             print("PointCloud Object")
+            obj = doc.addObject("Part::Feature","PointCloud")
+            vertexes = []
+            for i in range(geo.Count):
+                vertexes.append(Part.Vertex(self.r2fc.get_point(geo[i])))
+            obj.Shape = Part.Compound(vertexes)
+            return obj
 
         if isinstance(geo, r3.Surface):
             print("Surface Object")
+            s = self.r2fc.get_bspline_surface(geo.ToNurbsSurface())
+            obj = doc.addObject("Part::Feature","NurbsSurface")
+            obj.Shape = s.toShape()
+            return obj
 
     def import_curve(self, doc, geo):
         obj = None
@@ -270,6 +378,13 @@ class File3dm:
 
         elif isinstance(geo, r3.ArcCurve):
             print(">_ArcCurve Object")
+            #obj = doc.addObject("Part::Circle","ArcCurve")
+            #obj.Radius = geo.Radius
+            #TODO : Use a real circle
+            bs = self.r2fc.get_bspline_curve(geo.ToNurbsCurve())
+            if bs:
+                obj = doc.addObject("Part::Spline","ArcCurve")
+                obj.Shape = bs.toShape()
 
         return obj
 
@@ -285,6 +400,7 @@ def process3DM(doc, filename) :
         "Revision"]
 
     fi = File3dm(filename)
+    fi.parse_materials(doc)
     fi.parse_groups(doc)
     fi.parse_layers(doc)
     fi.parse_objects(doc)
